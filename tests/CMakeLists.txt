@@ -136,3 +136,8 @@ endif()
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+
+# dummy executable - not installed
+get_filename_component(TEST_TARGET test-d9m.cpp NAME_WE)
+add_executable(${TEST_TARGET} test-d9m.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE llama)

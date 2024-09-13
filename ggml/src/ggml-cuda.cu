@@ -27,7 +27,6 @@
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/softmax.cuh"
-#include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/unary.cuh"
@@ -170,17 +169,17 @@ static ggml_cuda_device_info ggml_cuda_init() {
     GGML_ASSERT(info.device_count <= GGML_CUDA_MAX_DEVICES);
 
     int64_t total_vram = 0;
-#ifdef GGML_CUDA_FORCE_MMQ
-    GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_MMQ:    yes\n", __func__);
-#else
-    GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_MMQ:    no\n", __func__);
-#endif // GGML_CUDA_FORCE_MMQ
-#ifdef GGML_CUDA_FORCE_CUBLAS
-    GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_CUBLAS: yes\n", __func__);
-#else
-    GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_CUBLAS: no\n", __func__);
-#endif // GGML_CUDA_FORCE_CUBLAS
-    GGML_CUDA_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices:\n", __func__, info.device_count);
+// #ifdef GGML_CUDA_FORCE_MMQ
+//     GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_MMQ:    yes\n", __func__);
+// #else
+//     GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_MMQ:    no\n", __func__);
+// #endif // GGML_CUDA_FORCE_MMQ
+// #ifdef GGML_CUDA_FORCE_CUBLAS
+//     GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_CUBLAS: yes\n", __func__);
+// #else
+//     GGML_CUDA_LOG_INFO("%s: GGML_CUDA_FORCE_CUBLAS: no\n", __func__);
+// #endif // GGML_CUDA_FORCE_CUBLAS
+//    GGML_CUDA_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices:\n", __func__, info.device_count);
     for (int id = 0; id < info.device_count; ++id) {
         int device_vmm = 0;
 
@@ -201,7 +200,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
-        GGML_CUDA_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s\n", id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
+        GGML_CUDA_LOG_INFO("CUDA Device: %s, compute capability %d.%d, VMM: %s\n", prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no");
 
         info.default_tensor_split[id] = total_vram;
         total_vram += prop.totalGlobalMem;
@@ -223,6 +222,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
+
+    int driver_version;
+    cudaDriverGetVersion(&driver_version);
+    GGML_CUDA_LOG_INFO("Driver version: %d.%d.%d\n", driver_version / 1000, (driver_version % 100) / 10, driver_version % 10);
+    int cuda_version;
+    cudaRuntimeGetVersion(&cuda_version);
+    GGML_CUDA_LOG_INFO("CUDA version: %d.%d.%d\n", cuda_version / 1000, (cuda_version % 100) / 10, cuda_version % 10);
 
     return info;
 }
@@ -2181,7 +2187,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_ADD:
-        case GGML_OP_ADD1: // TODO: more efficient implementation
             ggml_cuda_op_add(ctx, dst);
             break;
         case GGML_OP_SUB:
@@ -2198,9 +2203,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(dst)) {
-                case GGML_UNARY_OP_NEG:
-                    ggml_cuda_op_neg(ctx, dst);
-                    break;
                 case GGML_UNARY_OP_GELU:
                     ggml_cuda_op_gelu(ctx, dst);
                     break;
@@ -2308,9 +2310,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_POOL_2D:
             ggml_cuda_op_pool2d(ctx, dst);
-            break;
-        case GGML_OP_SUM:
-            ggml_cuda_op_sum(ctx, dst);
             break;
         case GGML_OP_SUM_ROWS:
             ggml_cuda_op_sum_rows(ctx, dst);
@@ -2580,15 +2579,8 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
                 cuda_ctx->cuda_graph->updated_kernel_arg.push_back((char **) &(node->src[1]->data));
                 // store a pointer to each copy op CUDA kernel to identify it later
                 void * ptr = ggml_cuda_cpy_fn(node->src[0], node->src[1]);
-                if (!ptr) {
-                    use_cuda_graph = false;
-#ifndef NDEBUG
-                    GGML_CUDA_LOG_WARN("%s: disabling CUDA graphs due to unsupported copy op\n", __func__);
-#endif
-                } else {
-                    if (std::find(ggml_cuda_cpy_fn_ptrs.begin(), ggml_cuda_cpy_fn_ptrs.end(), ptr) == ggml_cuda_cpy_fn_ptrs.end()) {
-                        ggml_cuda_cpy_fn_ptrs.push_back(ptr);
-                    }
+                if (std::find(ggml_cuda_cpy_fn_ptrs.begin(), ggml_cuda_cpy_fn_ptrs.end(), ptr) == ggml_cuda_cpy_fn_ptrs.end()) {
+                    ggml_cuda_cpy_fn_ptrs.push_back(ptr);
                 }
             }
 
@@ -2756,7 +2748,6 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
-                case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_RELU:
@@ -2858,9 +2849,6 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
-                if (src0_type == src1_type && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
-                    return true;
-                }
                 return false;
             } break;
         case GGML_OP_DUP:
@@ -2886,7 +2874,6 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NORM:
         case GGML_OP_ADD:
-        case GGML_OP_ADD1:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -2897,18 +2884,14 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_SIN:
         case GGML_OP_COS:
         case GGML_OP_CLAMP:
-            return true;
         case GGML_OP_CONT:
-            return op->src[0]->type != GGML_TYPE_BF16;
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SOFT_MAX:
             return true;
         case GGML_OP_ROPE:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_IM2COL:
-            return op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_POOL_2D:
-        case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_ARGSORT:
         case GGML_OP_ACC:
