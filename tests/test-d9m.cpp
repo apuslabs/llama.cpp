@@ -10,6 +10,9 @@
 #include "ggml-metal.h"
 #endif
 
+#include <functional>
+#include <cstddef>
+#include <sstream>
 #include <iomanip>
 #include <random>
 #include <chrono>
@@ -138,13 +141,11 @@ struct ggml_cgraph * build_graph(const test_model& model) {
     return gf;
 }
 
-struct ggml_tensor* compute(const test_model & model, ggml_gallocr_t allocr) {
+struct ggml_tensor* compute(const test_model & model, ggml_gallocr_t allocr, int n_threads) {
     struct ggml_cgraph * gf = build_graph(model);
 
     // allocate tensors
     ggml_gallocr_alloc_graph(allocr, gf);
-    int n_threads = 4;
-
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     }
@@ -252,7 +253,7 @@ void perform_gemm_test(float* a, float* b, float* expected, int M, int N, int K)
     printf("gemm_mult (%i): %s\n", (M * N), passed ? "\033[32mPASSED\033[0m" : "\033[31mFAILED\033[0m");
 }
 
-std::vector<float> perform_ggml_mul_mat(float* matrixA, float* matrixB, int M, int N, int K) {
+std::vector<float> perform_ggml_mul_mat(float* matrixA, float* matrixB, int M, int N, int K, int n_threads) {
     test_model model;
     load_model(model, matrixA, matrixB, M, N, K, true);
     
@@ -264,7 +265,7 @@ std::vector<float> perform_ggml_mul_mat(float* matrixA, float* matrixB, int M, i
 
     // compute the required memory
     ggml_gallocr_reserve(allocr, gf);    
-    struct ggml_tensor * result = compute(model, allocr);
+    struct ggml_tensor * result = compute(model, allocr, n_threads);
     std::vector<float> out_data(ggml_nelements(result));
     ggml_backend_tensor_get(result, out_data.data(), 0, ggml_nbytes(result));
 
@@ -273,80 +274,98 @@ std::vector<float> perform_ggml_mul_mat(float* matrixA, float* matrixB, int M, i
     ggml_backend_buffer_free(model.buffer);
     ggml_backend_free(model.backend);
     ggml_gallocr_free(allocr);
-
     return out_data;
 }
 
 bool are_vectors_bit_exact(const std::vector<float>& vec1, const std::vector<float>& vec2) {
+    // compare float vectors by bits
     if (vec1.size() != vec2.size()) {
         return false;
     }
     return std::memcmp(vec1.data(), vec2.data(), vec1.size() * sizeof(float)) == 0;
 }
 
-std::pair<float*, float*> generate_random_matrices(int M, int N, int K, int seed = -1) {
-    if (seed == -1) {
-        seed = std::chrono::system_clock::now().time_since_epoch().count();
-    }
-    printf("Using seed: %d\n", seed);
+std::pair<float*, float*> generate_random_matrices(int M, int N, int K, int seed) {
     std::mt19937 gen(seed);
     std::uniform_real_distribution<> dis(-100.0, 100.0);
 
     float* matrixA = new float[M * K];
-    printf("Matrix A (%d x %d):\n", M, K);
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < K; ++j) {
             matrixA[i * K + j] = dis(gen);
-            printf("%12.9f ", matrixA[i * K + j]);
         }
-        printf("\n");
     }
-    printf("\n");
 
     float* matrixB = new float[N * K];
-    printf("Matrix B (%d x %d):\n", N, K);
     for (int i = 0; i < N; ++i) {
         for (int j = 0; j < K; ++j) {
             matrixB[i * K + j] = dis(gen);
-            printf("%12.9f ", matrixB[i * K + j]);
         }
-        printf("\n");
     }
-    printf("\n");
-
     return std::make_pair(matrixA, matrixB);
+}
+
+std::string hash_vector_float_to_string(const std::vector<float>& vec) {
+    std::hash<float> hasher;
+    std::stringstream ss;
+    for (const auto& elem : vec) {
+        ss << std::hex << std::setw(8) << std::setfill('0') << hasher(elem);
+    }
+    std::string hash_str = ss.str();
+    hash_str = hash_str.substr(0, 32);
+    return hash_str;
 }
 
 int main(void)
 {
+    printf("====================== APUS Network Matrix Multiplication Determinism GPU Test ======================\n");
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     ggml_time_init();
     
     // generate two matrix
-    const int M = 4, N = 8, K = 12;
-    auto [matrixA, matrixB] = generate_random_matrices(M, N, K);
+    const int M = 100, N = 100, K = 100, n_threads = 10;
+    int seed = std::chrono::system_clock::now().time_since_epoch().count();
+    auto [matrixA, matrixB] = generate_random_matrices(M, N, K, seed);
 
     // first compute
-    std::vector<float> base_data = perform_ggml_mul_mat(matrixA, matrixB, M, N, K);
+    std::vector<float> base_data = perform_ggml_mul_mat(matrixA, matrixB, M, N, K, n_threads);
+    std::string base_hash = hash_vector_float_to_string(base_data);
 
+    // print param
+    printf("Number of threads: %d\n", n_threads);
+    printf("Seed to generate matrix: %d\n", seed);
+    printf("Matrix A (%d x %d):\n", M, K);
+    printf("Matrix B (%d x %d):\n", N, K);
+    printf("Result Matrix (%d x %d):\n", M, N);
+
+    printf("[============================================Test Results============================================]\n");
     // test 10 rounds
     bool all_passed = true;
-    for (int i = 1; i <= 10; i++) {
-        std::vector<float> comp_data = perform_ggml_mul_mat(matrixA, matrixB, M, N, K);
+    for (int i = 1; i <= 20; i++) {
+        std::vector<float> comp_data = perform_ggml_mul_mat(matrixA, matrixB, M, N, K, n_threads);
+        std::string comp_hash = hash_vector_float_to_string(comp_data);
         if (are_vectors_bit_exact(base_data, comp_data)) {
-            printf("Round %d \033[32mPASSED!\033[0m\n", i);
+            printf("%s Round%d\t\033[32mPASSED\033[0m\t|\033[32m%s\033[0m|\033[32m%s\033[0m|\t(Binary MATCH: 100%%)\n", u8"\U00002705", i, base_hash.c_str(), comp_hash.c_str());
         } else {
-            printf("Round %d \033[32mFAILED!\033[0m\n", i);
+            printf("%s Round%d\t\033[31mFAILED\033[0m\t|%s|%s|\n", u8"\U0000274E", i, base_hash.c_str(), comp_hash.c_str());
             all_passed = false;
         }
     }
-
-    if (all_passed) {
-        printf("All tests \033[32mPASSED\033[0m!\n");
-    }
+    printf("[====================================================================================================]\n");
 
     // free mem
     delete[] matrixA;
     delete[] matrixB;
-    
+
+    if (all_passed) {
+        printf("Final Result: \033[32mALL TESTS PASSED\033[0m\n");
+        printf("Accuracy: \033[32m100%%\033[0m\n");
+    }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    printf("Time taken: \033[32m%ldms\033[0m\n", duration);
+
+    printf("============================================Test Complete============================================\n");
     return 0;
 }
